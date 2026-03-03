@@ -1,0 +1,16 @@
+#:schema https://rlbot.org/schemas/match.json
+[rlbot]
+launcher = "Steam"
+# We'll run the bot ourself so we don't have restart the match
+# `python src/bot.py` in our case
+auto_start_agents = false
+
+[match]
+enable_rendering = true
+
+[mutators]
+match_length = "Unlimited"
+
+[[cars]]
+config_file = "src/bot.toml"
+team = 0

@@ -44,14 +44,22 @@ class MyBot(Bot):
         if self.active_sequence is not None and not self.active_sequence.done:
             return self.active_sequence.tick(packet)
 
-        # Gather some information about our car and the ball
         my_car = packet.players[self.index]
         car_location = Vec3(my_car.physics.location)
         car_velocity = Vec3(my_car.physics.velocity)
         ball_location = Vec3(packet.balls[0].physics.location)
 
-        # By default we will chase the ball, but target_location can be changed later
         target_location = ball_location
+
+        own_goal_y = -5120 if my_car.team == 0 else 5120
+        own_goal = Vec3(0, own_goal_y, 0)
+
+        ball_to_our_goal = own_goal - ball_location
+
+        if ball_to_our_goal.length() < 3000:
+            behind_ball = (ball_location - own_goal).flat()
+            if behind_ball.length() > 0:
+                target_location = ball_location + behind_ball.rescale(1500)
 
         self.renderer.begin_rendering()
 
@@ -91,14 +99,20 @@ class MyBot(Bot):
 
         self.renderer.end_rendering()
 
-        if 750 < car_velocity.length() < 800:
-            # We'll do a front flip if the car is moving at a certain speed.
+        speed = car_velocity.length()
+
+        if car_location.dist(ball_location) < 700 and speed > 900:
             return self.begin_front_flip(packet)
 
         controls = ControllerState()
         controls.steer = steer_toward_target(my_car, target_location)
         controls.throttle = 1.0
-        # You can set more controls if you want, like controls.boost.
+
+        if abs(controls.steer) < 0.2 and speed < 2200:
+            controls.boost = True
+
+        if car_location.dist(target_location) < 2000 and abs(controls.steer) > 0.5:
+            controls.handbrake = True
 
         return controls
 

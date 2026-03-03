@@ -66,7 +66,7 @@ There are two common ways:
 
 1. **Via RLBot GUI**
 
-   - Open `Opponent/rlbot.toml` in the RLBot GUI.
+   - Open `Opponent/src/bot.toml` in the RLBot GUI.
    - Click **Run** to start a match with the opponent bot.
 2. **Via script** (depending on how `run.py` is set up):
 

@@ -1,0 +1,9 @@
+[settings]
+# Nom affiché en jeu
+name = "PRL-PPO"
+# Commande de lancement (chemin relatif depuis ce fichier)
+run_command = "..\\venv\\Scripts\\python bot.py"
+# ID unique du bot
+agent_id = "rlbot_community/prl_ppo"
+# Apparence (optionnel — reprend le loadout de l'opponent)
+loadout_file = "../Opponent/src/loadout.toml"

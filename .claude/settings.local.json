@@ -1,7 +1,16 @@
 {
   "permissions": {
     "allow": [
-      "Bash(venv/Scripts/python -c \":*)"
+      "Bash(venv/Scripts/python -c \":*)",
+      "Bash(mkdir -p \"c:/Users/THIBA/Desktop/_Work/PRL/AI/data/tensorboard/old\")",
+      "Bash(mv \"c:/Users/THIBA/Desktop/_Work/PRL/AI/data/tensorboard\"/events.out.* \"c:/Users/THIBA/Desktop/_Work/PRL/AI/data/tensorboard/old/\")",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "WebFetch(domain:rlgym.org)",
+      "WebFetch(domain:bryantmcarthur.com)",
+      "Bash(rm -rf \"c:/Users/THIBA/Desktop/_Work/PRL/AI/data/checkpoints/prl-run\")",
+      "Bash(cp -r \"c:/Users/THIBA/Desktop/_Work/PRL/AI/data/checkpoints/prl-run-gold-340M\" \"c:/Users/THIBA/Desktop/_Work/PRL/AI/data/checkpoints/prl-run\")",
+      "WebFetch(domain:www.jeremiahcoholich.com)"
     ]
   }
 }

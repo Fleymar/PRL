@@ -167,13 +167,9 @@ class PPOBot(Bot):
     # ------------------------------------------------------------------
 
     def _load_policy(self):
-        checkpoint_root = Path(__file__).resolve().parent / "data" / "checkpoints"
-        run_dirs = sorted(p for p in checkpoint_root.iterdir() if p.is_dir())
-        if not run_dirs:
-            raise FileNotFoundError(f"Aucun run trouvé dans {checkpoint_root}")
-
+        checkpoint_root = Path(__file__).resolve().parent / "data" / "checkpoints" / "prl-run"
         step_dirs = sorted(
-            (p for p in run_dirs[-1].iterdir() if p.is_dir() and p.name.isdigit()),
+            (p for p in checkpoint_root.iterdir() if p.is_dir() and p.name.isdigit()),
             key=lambda p: int(p.name),
         )
         if not step_dirs:

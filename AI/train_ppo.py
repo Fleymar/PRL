@@ -1,8 +1,19 @@
+"""
+train_ppo.py — Architecture améliorée :
+  • Action space : 90 actions discrètes (lookup table pruné)
+  • Rewards     : distance exponentielle, touch hauteur, flip reset, boost, team spirit
+  • Obs         : ExtendedObs 101 floats
+  • Réseau      : DiscreteFF 101→512→512→90 (via rlgym-ppo)
+  • Adversaire  : self-play (les deux agents s'entraînent ensemble)
+"""
+
 import math
 import os
+import random
 from pathlib import Path
 from typing import Any, Dict
 
+import gym
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -12,70 +23,55 @@ from rlgym.api import RLGym
 from rlgym.rocket_league import common_values
 from rlgym.rocket_league.action_parsers import RepeatAction
 from rlgym.rocket_league.api import GameState
-from rlgym.rocket_league.common_values import ORANGE_TEAM, BACK_NET_Y, BLUE_TEAM
+from rlgym.rocket_league.common_values import (
+    ORANGE_TEAM, BLUE_TEAM, BACK_NET_Y,
+    CAR_MAX_SPEED, CAR_MAX_ANG_VEL,
+    BALL_RADIUS, CEILING_Z, GOAL_HEIGHT,
+)
 from rlgym.rocket_league.done_conditions import (
-    AnyCondition,
-    GoalCondition,
-    NoTouchTimeoutCondition,
-    TimeoutCondition,
+    AnyCondition, GoalCondition, NoTouchTimeoutCondition, TimeoutCondition,
 )
 from rlgym.rocket_league.obs_builders import DefaultObs
-from rlgym.rocket_league.reward_functions import GoalReward
 from rlgym.rocket_league.sim import RocketSimEngine
 from rlgym.rocket_league.state_mutators import (
-    FixedTeamSizeMutator,
-    KickoffMutator,
-    MutatorSequence,
+    FixedTeamSizeMutator, KickoffMutator, MutatorSequence,
 )
 
 from rlgym_ppo import Learner
 from rlgym_ppo.util import RLGymV2GymWrapper
 from rlgym_ppo.util import reporting as _reporting
 
-import gym
-
-# Répertoire de travail = AI/
 os.chdir(Path(__file__).resolve().parent)
 
 # ---------------------------------------------------------------------------
-# Hyperparamètres globaux
+# Hyperparamètres
 # ---------------------------------------------------------------------------
-TOTAL_TIMESTEPS = 2_000_000_000
-N_PROC          = 14
-ACTION_REPEAT   = 8   # doit correspondre à RepeatAction(repeats=8)
+TOTAL_TIMESTEPS = 500_000_000   # fresh start
+N_PROC          = 40
+ACTION_REPEAT   = 8
 
-# Offset curriculum — permet de reprendre directement en Phase 3
-# après un restart depuis un checkpoint avancé
-CURRICULUM_OFFSET = 100_000_000
+# Cosine LR schedule (Necto utilise 1e-4 fixe, on garde notre cosine)
+LR_INITIAL = 5e-4
+LR_FINAL   = 5e-5
+LR_CYCLE   = 100_000_000
 
-# Phases du curriculum (en timesteps globaux estimés)
-PHASE1_END = 20_000_000   # 0  → 20M : apprendre à bouger et toucher la balle
-PHASE2_END = 60_000_000   # 20M→ 60M : orienter la balle vers le but
-                           # 60M→500M : marquer / défendre
-
-# Learning rate schedule
-# Cosine annealing avec période de 100M steps → remonte le LR périodiquement
-# pour sortir des local optima, au lieu d'une décroissance linéaire monotone.
-LR_INITIAL  = 5e-4
-LR_FINAL    = 5e-5   # floor du cosine (était 1e-5, trop bas)
-LR_CYCLE    = 100_000_000  # redémarre tous les 100M steps
+# Goals Necto-style
+BLUE_GOAL   = np.array([0.0, -BACK_NET_Y, 0.0], dtype=np.float32)
+ORANGE_GOAL = np.array([0.0,  BACK_NET_Y, 0.0], dtype=np.float32)
 
 # ---------------------------------------------------------------------------
-# TensorBoard + LR Scheduler
+# TensorBoard + LR scheduler
 # ---------------------------------------------------------------------------
-tb_writer = SummaryWriter(log_dir="data/tensorboard/run7", flush_secs=10)
+tb_writer = SummaryWriter(log_dir="data/tensorboard/run8", flush_secs=10)
 _learner  = None
 
 _original_report = _reporting.report_metrics
 
 def _tb_report_metrics(loggable_metrics, debug_metrics, wandb_run=None):
     _original_report(loggable_metrics, debug_metrics, wandb_run)
-
     step = loggable_metrics.get("Cumulative Timesteps", 0)
 
     if _learner is not None:
-        # Cosine annealing avec restarts tous les LR_CYCLE steps
-        # Permet de sortir des plateaux sans LR monotone décroissant
         cycle_pos = step % LR_CYCLE
         t_cycle   = cycle_pos / LR_CYCLE
         new_lr    = LR_FINAL + 0.5 * (LR_INITIAL - LR_FINAL) * (1.0 + math.cos(math.pi * t_cycle))
@@ -94,7 +90,7 @@ _reporting.report_metrics = _tb_report_metrics
 
 
 # ---------------------------------------------------------------------------
-# Custom Obs Builder (DefaultObs + 9 vecteurs relatifs)
+# ExtendedObs — 101 floats (inchangé)
 # ---------------------------------------------------------------------------
 class ExtendedObs(DefaultObs):
     def get_obs_space(self, agent: AgentID):
@@ -103,11 +99,10 @@ class ExtendedObs(DefaultObs):
 
     def _build_obs(self, agent: AgentID, state: GameState, shared_info: dict) -> np.ndarray:
         base_obs = super()._build_obs(agent, state, shared_info)
-
         car     = state.cars[agent]
         invert  = (car.team_num == ORANGE_TEAM)
-        ball    = state.inverted_ball    if invert else state.ball
-        physics = car.inverted_physics   if invert else car.physics
+        ball    = state.inverted_ball  if invert else state.ball
+        physics = car.inverted_physics if invert else car.physics
 
         own_goal   = np.array([0.0,  BACK_NET_Y, 0.0], dtype=np.float32)
         their_goal = np.array([0.0, -BACK_NET_Y, 0.0], dtype=np.float32)
@@ -125,24 +120,39 @@ class ExtendedObs(DefaultObs):
 
 
 # ---------------------------------------------------------------------------
-# MultiDiscrete Action Parser
+# DiscreteActionParser — 90 actions discrètes (port exact de Necto/training/parser.py)
 # ---------------------------------------------------------------------------
-_BINS = [
-    [-1.0,  0.0,  1.0],   # throttle
-    [-1.0,  0.0,  1.0],   # steer
-    [-1.0,  0.0,  1.0],   # pitch
-    [-1.0,  0.0,  1.0],   # yaw
-    [-1.0,  0.0,  1.0],   # roll
-    [ 0.0,  1.0],          # jump
-    [ 0.0,  1.0],          # boost
-    [ 0.0,  1.0],          # handbrake
-]
-_BIN_SIZES = [len(b) for b in _BINS]
+class DiscreteActionParser(ActionParser):
+    def __init__(self):
+        self._lookup_table = self._make_lookup_table()
 
+    @staticmethod
+    def _make_lookup_table() -> np.ndarray:
+        actions = []
+        # Ground : throttle × steer × boost × handbrake (sans boost sans plein throttle)
+        for throttle in (-1, 0, 1):
+            for steer in (-1, 0, 1):
+                for boost in (0, 1):
+                    for handbrake in (0, 1):
+                        if boost == 1 and throttle != 1:
+                            continue
+                        actions.append([throttle or boost, steer, 0, steer, 0, 0, boost, handbrake])
+        # Aerial : pitch × yaw × roll × jump × boost (sans yaw+jump, sans noop)
+        for pitch in (-1, 0, 1):
+            for yaw in (-1, 0, 1):
+                for roll in (-1, 0, 1):
+                    for jump in (0, 1):
+                        for boost in (0, 1):
+                            if jump == 1 and yaw != 0:
+                                continue
+                            if pitch == roll == jump == 0:
+                                continue
+                            handbrake = int(jump == 1 and (pitch != 0 or yaw != 0 or roll != 0))
+                            actions.append([boost, yaw, pitch, yaw, roll, jump, boost, handbrake])
+        return np.array(actions, dtype=np.float32)
 
-class MultiDiscreteActionParser(ActionParser):
     def get_action_space(self, agent: AgentID):
-        return 'multi_discrete', _BIN_SIZES
+        return 'discrete', len(self._lookup_table)
 
     def reset(self, agents, initial_state, shared_info) -> None:
         pass
@@ -152,323 +162,283 @@ class MultiDiscreteActionParser(ActionParser):
                       shared_info: Dict[str, Any]) -> Dict[AgentID, np.ndarray]:
         parsed = {}
         for agent, action in actions.items():
-            parsed[agent] = np.array(
-                [_BINS[i][int(action[i])] for i in range(len(_BINS))],
-                dtype=np.float32,
-            )
+            parsed[agent] = self._lookup_table[int(action)]
         return parsed
 
 
-class MultiDiscreteGymWrapper(RLGymV2GymWrapper):
+# Wrapper gym pour espace d'action discret
+class DiscreteGymWrapper(RLGymV2GymWrapper):
     def __init__(self, rlgym_env):
         super().__init__(rlgym_env)
         act_space = list(rlgym_env.action_spaces.values())[0][1]
-        if isinstance(act_space, (list, tuple)):
-            self.action_space = gym.spaces.MultiDiscrete(act_space)
+        if isinstance(act_space, int):
+            self.action_space = gym.spaces.Discrete(n=act_space)
 
 
 # ---------------------------------------------------------------------------
-# Reward Functions
+# AdvancedReward — port rlgym-v2 du NectoRewardFunction (sans rocket_learn)
 # ---------------------------------------------------------------------------
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na < 1e-6 or nb < 1e-6:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
 
-class SpeedTowardBallReward(RewardFunction[AgentID, GameState, float]):
-    """
-    Vitesse du bot vers la balle, clampée à [0, 1].
-    Jamais négative → un flip latéral/arrière donne 0, impossible à farmer.
-    """
-    def reset(self, agents, initial_state, shared_info) -> None:
-        pass
 
-    def get_rewards(self, agents, state, is_terminated, is_truncated, shared_info):
+def _height_activation(z: float) -> float:
+    return float(np.cbrt((z - 150.0) / CEILING_Z))
+
+
+def _dist_to_closest_wall(x: float, y: float) -> float:
+    dist_side = abs(4096 - abs(x))
+    dist_back = abs(5120 - abs(y))
+    # Distance au coin coupé
+    x1, y1, x2, y2 = 4096 - 1152, 5120, 4096, 5120 - 1152
+    A, B = abs(x) - x1, abs(y) - y1
+    C, D = x2 - x1, y2 - y1
+    len_sq = C * C + D * D
+    param = (A * C + B * D) / len_sq if len_sq != 0 else -1
+    xx = x1 + np.clip(param, 0, 1) * C
+    yy = y1 + np.clip(param, 0, 1) * D
+    dist_corner = math.sqrt((abs(x) - xx) ** 2 + (abs(y) - yy) ** 2)
+    return min(dist_side, dist_back, dist_corner)
+
+
+class AdvancedReward(RewardFunction[AgentID, GameState, float]):
+    """
+    Port rlgym-v2 du NectoRewardFunction.
+    Supprimé : win_prob (nécessite rocket_learn), scoreboard.
+    Conservé  : distance exponentielle, touch hauteur (racine cubique),
+                flip reset, boost gain/lose, ang_vel, demo, team spirit.
+    """
+
+    def __init__(
+        self,
+        team_spirit: float = 0.6,
+        goal_w:         float = 10.0,
+        goal_dist_w:    float = 10.0,
+        demo_w:         float = 8.0,
+        dist_w:         float = 0.25,
+        align_w:        float = 0.25,
+        boost_gain_w:   float = 1.5,
+        boost_lose_w:   float = 0.8,
+        ang_vel_w:      float = 0.005,
+        touch_grass_w:  float = 0.005,
+        touch_height_w: float = 3.0,
+        touch_accel_w:  float = 0.5,
+        flip_reset_w:   float = 10.0,
+        opponent_punish_w: float = 1.0,
+    ):
+        self._ts            = team_spirit
+        self._goal_w        = goal_w
+        self._goal_dist_w   = goal_dist_w
+        self._demo_w        = demo_w
+        self._dist_w        = dist_w
+        self._align_w       = align_w
+        self._boost_gain_w  = boost_gain_w
+        self._boost_lose_w  = boost_lose_w
+        self._ang_vel_w     = ang_vel_w
+        self._touch_grass_w = touch_grass_w
+        self._touch_height_w = touch_height_w
+        self._touch_accel_w = touch_accel_w
+        self._flip_reset_w  = flip_reset_w
+        self._opp_w         = opponent_punish_w
+
+        # État précédent
+        self._prev_ball_vel      : np.ndarray = None
+        self._prev_boosts        : dict = {}
+        self._prev_has_flip      : dict = {}
+        self._prev_demo          : dict = {}
+        self._prev_state_quality : float = 0.0
+        self._prev_player_qual   : dict = {}
+
+    # ------------------------------------------------------------------
+    def _state_quality(self, state: GameState) -> float:
+        ball = state.ball.position
+        return float(0.5 * self._goal_dist_w * (
+            np.exp(-np.linalg.norm(ORANGE_GOAL - ball) / CAR_MAX_SPEED)
+            - np.exp(-np.linalg.norm(BLUE_GOAL  - ball) / CAR_MAX_SPEED)
+        ))
+
+    def _player_quality(self, agent_id: AgentID, state: GameState) -> float:
+        car  = state.cars[agent_id]
+        pos  = car.physics.position
+        ball = state.ball.position
+        liu  = float(np.exp(-np.linalg.norm(ball - pos) / 1410.0))
+        goal = ORANGE_GOAL if car.team_num == BLUE_TEAM else BLUE_GOAL
+        align = _cosine_sim(ball - pos, goal - pos)
+        if car.team_num == ORANGE_TEAM:
+            align *= -1
+        return self._dist_w * liu + self._align_w * align
+
+    # ------------------------------------------------------------------
+    def reset(self, agents, initial_state: GameState, shared_info=None) -> None:
+        self._prev_ball_vel = np.array(initial_state.ball.linear_velocity, dtype=np.float32)
+        self._prev_state_quality = self._state_quality(initial_state)
+        for a in agents:
+            car = initial_state.cars[a]
+            self._prev_boosts[a]   = float(car.boost_amount)
+            self._prev_has_flip[a] = bool(car.has_flip)
+            self._prev_demo[a]     = bool(car.is_demoed)
+            self._prev_player_qual[a] = self._player_quality(a, initial_state)
+
+    # ------------------------------------------------------------------
+    def get_rewards(self, agents, state: GameState,
+                    is_terminated, _is_truncated, _shared_info):
+        sq  = self._state_quality(state)
+        pq  = {a: self._player_quality(a, state) for a in agents}
+        curr_ball_vel = np.array(state.ball.linear_velocity, dtype=np.float32)
+        delta_ball_vel = float(np.linalg.norm(curr_ball_vel - self._prev_ball_vel))
+
         rewards = {}
-        ball_pos = state.ball.position
-        for agent in agents:
-            car  = state.cars[agent]
-            diff = ball_pos - car.physics.position
-            dist = np.linalg.norm(diff)
-            if dist < 1e-6:
-                rewards[agent] = 0.0
-                continue
-            vel_toward = float(np.dot(car.physics.linear_velocity, diff / dist))
-            rewards[agent] = max(0.0, vel_toward / common_values.CAR_MAX_SPEED)
+        for agent_id in agents:
+            car = state.cars[agent_id]
+            pos = car.physics.position
+            r   = 0.0
+
+            # ---- Qualité d'état (balle qui se rapproche du bon but) ----
+            delta_sq = sq - self._prev_state_quality
+            r += delta_sq if car.team_num == BLUE_TEAM else -delta_sq
+
+            # ---- Qualité joueur (positionnement + alignement) ----
+            r += pq[agent_id] - self._prev_player_qual.get(agent_id, 0.0)
+
+            # ---- Touch rewards ----
+            if car.ball_touches > 0:
+                ball_h = state.ball.position[2]
+                avg_h  = 0.5 * (pos[2] + ball_h)
+                h0 = _height_activation(0.0)
+                h1 = _height_activation(float(CEILING_Z))
+                hx = _height_activation(avg_h)
+                height_factor = ((hx - h0) / (h1 - h0 + 1e-6)) ** 2
+                wall_dist_f = 1 - np.exp(
+                    -_dist_to_closest_wall(float(pos[0]), float(pos[1])) / CAR_MAX_SPEED
+                )
+                r += self._touch_height_w * height_factor * (1 + wall_dist_f)
+
+                # Flip reset (air dribble setup)
+                has_flip_now = bool(car.has_flip)
+                had_flip     = self._prev_has_flip.get(agent_id, False)
+                if (has_flip_now and not had_flip
+                        and pos[2] > 3 * BALL_RADIUS
+                        and np.linalg.norm(state.ball.position - pos) < 2 * BALL_RADIUS):
+                    up = car.physics.rotation_mtx[2]
+                    if _cosine_sim(state.ball.position - pos, -up) > 0.9:
+                        r += self._flip_reset_w
+
+                # Accélération balle (tir fort = plus de reward)
+                r += self._touch_accel_w * (1 - height_factor) * delta_ball_vel / CAR_MAX_SPEED
+
+            # ---- Boost management ----
+            prev_b    = self._prev_boosts.get(agent_id, float(car.boost_amount))
+            boost_now = float(car.boost_amount)
+            boost_diff = (math.sqrt(max(boost_now, 0.0)) - math.sqrt(max(prev_b, 0.0)))
+            if boost_diff >= 0:
+                r += self._boost_gain_w * boost_diff
+            elif pos[2] < GOAL_HEIGHT:
+                r += self._boost_lose_w * boost_diff * (1 - pos[2] / GOAL_HEIGHT)
+
+            # ---- Angular velocity (encourage l'exploration aérienne) ----
+            ang_vel_norm = float(np.linalg.norm(car.physics.angular_velocity)) / CAR_MAX_ANG_VEL
+            r += ang_vel_norm * self._ang_vel_w
+
+            # ---- Touch grass penalty ----
+            if car.on_ground and pos[2] < BALL_RADIUS:
+                r -= self._touch_grass_w
+
+            # ---- Demo : pénalité sur la victime ----
+            is_demo  = bool(car.is_demoed)
+            was_demo = self._prev_demo.get(agent_id, False)
+            if is_demo and not was_demo:
+                r -= self._demo_w / 2
+
+            rewards[agent_id] = r
+
+        # ---- Demo : bonus pour le demoeur ----
+        for agent_id in agents:
+            for other_id in agents:
+                if other_id == agent_id:
+                    continue
+                other = state.cars[other_id]
+                if bool(other.is_demoed) and not self._prev_demo.get(other_id, False):
+                    rewards[agent_id] += self._demo_w / 2
+
+        # ---- Goal reward ----
+        any_terminated = any(is_terminated.values()) if isinstance(is_terminated, dict) else bool(is_terminated)
+        if any_terminated:
+            ball_y = float(state.ball.position[1])
+            if ball_y > BACK_NET_Y * 0.5:        # balle dans le but orange
+                for a in agents:
+                    rewards[a] += self._goal_w if state.cars[a].team_num == BLUE_TEAM else -self._goal_w
+            elif ball_y < -BACK_NET_Y * 0.5:     # balle dans le but blue
+                for a in agents:
+                    rewards[a] += self._goal_w if state.cars[a].team_num == ORANGE_TEAM else -self._goal_w
+
+        # ---- Team spirit blending (Necto : 0.6) ----
+        blue_ids   = [a for a in agents if state.cars[a].team_num == BLUE_TEAM]
+        orange_ids = [a for a in agents if state.cars[a].team_num == ORANGE_TEAM]
+        if blue_ids and orange_ids:
+            br = np.array([rewards[a] for a in blue_ids])
+            or_ = np.array([rewards[a] for a in orange_ids])
+            bm  = float(np.nan_to_num(br.mean()))
+            om  = float(np.nan_to_num(or_.mean()))
+            for i, a in enumerate(blue_ids):
+                rewards[a] = (1 - self._ts) * br[i] + self._ts * bm - self._opp_w * om
+            for i, a in enumerate(orange_ids):
+                rewards[a] = (1 - self._ts) * or_[i] + self._ts * om - self._opp_w * bm
+
+        # ---- Mise à jour de l'état précédent ----
+        self._prev_ball_vel      = curr_ball_vel.copy()
+        self._prev_state_quality = sq
+        self._prev_player_qual   = pq
+        for a in agents:
+            car = state.cars[a]
+            self._prev_boosts[a]   = float(car.boost_amount)
+            self._prev_has_flip[a] = bool(car.has_flip)
+            self._prev_demo[a]     = bool(car.is_demoed)
+
         return rewards
 
 
-class VelocityBallToGoalReward(RewardFunction[AgentID, GameState, float]):
-    def reset(self, agents, initial_state, shared_info) -> None:
-        pass
-
-    def get_rewards(self, agents, state, is_terminated, is_truncated, shared_info):
-        rewards = {}
-        ball_pos = state.ball.position
-        ball_vel = state.ball.linear_velocity
-        for agent in agents:
-            car      = state.cars[agent]
-            goal_pos = np.array(
-                [0.0, common_values.BACK_NET_Y if car.team_num == BLUE_TEAM
-                 else -common_values.BACK_NET_Y, 0.0], dtype=np.float32
-            )
-            diff = goal_pos - ball_pos
-            dist = np.linalg.norm(diff)
-            if dist < 1e-6:
-                rewards[agent] = 0.0
-                continue
-            rewards[agent] = float(np.dot(ball_vel, diff / dist)) / common_values.BALL_MAX_SPEED
-        return rewards
-
-
-class TouchDeltaVReward(RewardFunction[AgentID, GameState, float]):
-    """
-    Reward proportionnel au changement de vitesse de la balle lors d'un touch.
-    Un vrai tir puissant → reward élevé. Un push léger → presque 0.
-    Le delta est calculé une seule fois par step (partagé entre agents)
-    mais appliqué uniquement aux agents qui ont touché la balle.
-    """
-    def __init__(self):
-        self._prev_ball_vel = None
-        self._cached_delta  = 0.0  # delta calculé une seule fois par step
-
-    def reset(self, agents, initial_state, shared_info) -> None:
-        self._prev_ball_vel = None
-        self._cached_delta  = 0.0
-
-    def get_rewards(self, agents, state, is_terminated, is_truncated, shared_info):
-        curr_vel = np.array(state.ball.linear_velocity, dtype=np.float32)
-
-        if self._prev_ball_vel is None:
-            self._prev_ball_vel = curr_vel.copy()
-            return {agent: 0.0 for agent in agents}
-
-        # Calculer le delta une seule fois pour ce step
-        delta_v = float(np.linalg.norm(curr_vel - self._prev_ball_vel))
-        self._prev_ball_vel = curr_vel.copy()
-
-        rewards = {}
-        for agent in agents:
-            car = state.cars[agent]
-            if car.ball_touches > 0 and delta_v > 0.0:
-                rewards[agent] = delta_v / common_values.BALL_MAX_SPEED
-            else:
-                rewards[agent] = 0.0
-        return rewards
-
-
-class HighVelocitySaveReward(RewardFunction[AgentID, GameState, float]):
-    SPEED_THRESHOLD = 800.0
-
-    def reset(self, agents, initial_state, shared_info) -> None:
-        pass
-
-    def get_rewards(self, agents, state, is_terminated, is_truncated, shared_info):
-        rewards = {}
-        ball_vel = state.ball.linear_velocity
-        for agent in agents:
-            car = state.cars[agent]
-            if car.team_num == BLUE_TEAM:
-                vel_toward_our_goal = -ball_vel[1]
-            else:
-                vel_toward_our_goal =  ball_vel[1]
-            if vel_toward_our_goal > self.SPEED_THRESHOLD and car.ball_touches > 0:
-                rewards[agent] = vel_toward_our_goal / common_values.BALL_MAX_SPEED
-            else:
-                rewards[agent] = 0.0
-        return rewards
-
-
-class DefensivePenaltyReward(RewardFunction[AgentID, GameState, float]):
-    def reset(self, agents, initial_state, shared_info) -> None:
-        pass
-
-    def get_rewards(self, agents, state, is_terminated, is_truncated, shared_info):
-        rewards = {}
-        ball_y = state.ball.position[1]
-        for agent in agents:
-            car = state.cars[agent]
-            if car.team_num == BLUE_TEAM:
-                in_our_half = ball_y < 0.0
-            else:
-                in_our_half = ball_y > 0.0
-            rewards[agent] = -1.0 if in_our_half else 0.0
-        return rewards
-
-
 # ---------------------------------------------------------------------------
-# Curriculum Combined Reward
+# Population Self-Play Wrapper
 # ---------------------------------------------------------------------------
-
-def _lerp(a: float, b: float, t: float) -> float:
-    return a + (b - a) * max(0.0, min(1.0, t))
+_N_ACTIONS = len(DiscreteActionParser._make_lookup_table())   # 90
 
 
-class CurriculumCombinedReward(RewardFunction[AgentID, GameState, float]):
+class PopulationSelfPlayWrapper(gym.Env):
     """
-    Phase 1 (0→20M)   : poids fixes — apprendre à bouger et toucher
-    Phase 2 (20→60M)  : speed_toward diminue progressivement, ball_to_goal monte
-    Phase 3 (60→300M) : focus marquer/défendre, dense reward maintenu pour le signal
-    """
-
-    def __init__(self, n_proc: int = N_PROC):
-        self._n_proc      = n_proc
-        self._local_steps = 0
-        self._speed       = SpeedTowardBallReward()
-        self._btg         = VelocityBallToGoalReward()
-        self._touch       = TouchDeltaVReward()
-        self._goal        = GoalReward()
-        self._save        = HighVelocitySaveReward()
-        self._defensive   = DefensivePenaltyReward()
-
-    @property
-    def _global_steps(self) -> int:
-        # _local_steps est incrémenté par step d'env (un seul env par instance).
-        # On multiplie par ACTION_REPEAT (8) pour avoir des env-steps réels,
-        # puis on approxime les agent-steps globaux.
-        # N_PROC workers × steps_par_env ≈ total agent timesteps.
-        return self._local_steps * ACTION_REPEAT + CURRICULUM_OFFSET
-
-    def _get_weights(self) -> dict:
-        gs = self._global_steps
-
-        if gs <= PHASE1_END:
-            # Poids fixes — cible stable pour l'apprentissage initial
-            return dict(
-                speed     = 2.0,
-                btg       = 0.5,
-                touch     = 3.0,
-                goal      = 15.0,
-                save      = 0.0,
-                defensive = 0.0,
-            )
-        elif gs <= PHASE2_END:
-            t = (gs - PHASE1_END) / (PHASE2_END - PHASE1_END)
-            return dict(
-                speed     = _lerp(2.0,  0.0, t),
-                btg       = _lerp(0.5,  3.0, t),
-                touch     = _lerp(3.0,  1.0, t),
-                goal      = _lerp(15.0, 20.0, t),
-                save      = _lerp(0.0,  2.0, t),
-                defensive = _lerp(0.0,  0.002, t),
-            )
-        else:
-            t = min((gs - PHASE2_END) / (TOTAL_TIMESTEPS - PHASE2_END), 1.0)
-            return dict(
-                # Floors élevés : le critic doit toujours avoir un signal dense
-                # pour estimer la valeur des états. Sans ça → gradient = bruit → collapse.
-                speed     = _lerp(2.0,  0.5, t),   # jamais < 0.5
-                btg       = _lerp(3.0,  2.0, t),   # jamais < 2.0
-                touch     = _lerp(1.5,  0.8, t),   # jamais < 0.8
-                goal      = _lerp(20.0, 25.0, t),  # 20-25 max, pas 40-50
-                save      = _lerp(2.0,  3.0, t),
-                defensive = _lerp(0.002, 0.003, t),
-            )
-
-    def reset(self, agents, initial_state, shared_info) -> None:
-        self._speed.reset(agents, initial_state, shared_info)
-        self._btg.reset(agents, initial_state, shared_info)
-        self._touch.reset(agents, initial_state, shared_info)
-        self._goal.reset(agents, initial_state, shared_info)
-        self._save.reset(agents, initial_state, shared_info)
-        self._defensive.reset(agents, initial_state, shared_info)
-
-    def get_rewards(self, agents, state, is_terminated, is_truncated, shared_info):
-        self._local_steps += 1
-        w = self._get_weights()
-
-        r_speed = self._speed.get_rewards(agents, state, is_terminated, is_truncated, shared_info)
-        r_btg   = self._btg.get_rewards(agents, state, is_terminated, is_truncated, shared_info)
-        r_touch = self._touch.get_rewards(agents, state, is_terminated, is_truncated, shared_info)
-        r_goal  = self._goal.get_rewards(agents, state, is_terminated, is_truncated, shared_info)
-        r_save  = self._save.get_rewards(agents, state, is_terminated, is_truncated, shared_info)
-        r_def   = self._defensive.get_rewards(agents, state, is_terminated, is_truncated, shared_info)
-
-        return {
-            agent: (
-                w['speed']     * r_speed[agent] +
-                w['btg']       * r_btg[agent]   +
-                w['touch']     * r_touch[agent] +
-                w['goal']      * r_goal[agent]  +
-                w['save']      * r_save[agent]  +
-                w['defensive'] * r_def[agent]
-            )
-            for agent in agents
-        }
-
-
-# ---------------------------------------------------------------------------
-# Heuristic Opponent (remplace le self-play)
-# ---------------------------------------------------------------------------
-
-def _heuristic_action(state, agent_id) -> np.ndarray:
-    """
-    Adversaire heuristique agressif : fonce sur la balle avec boost,
-    essaie de tirer vers le but adverse.
-    Retourne indices MultiDiscrete [throttle, steer, pitch, yaw, roll, jump, boost, handbrake].
-    """
-    car  = state.cars[agent_id]
-    # Coordonnées dans le repère "toujours blue" pour cohérence
-    phys = car.inverted_physics if car.is_orange else car.physics
-    ball = state.inverted_ball   if car.is_orange else state.ball
-
-    car_pos  = phys.position        # (3,)
-    ball_pos = ball.position        # (3,)
-
-    # Vecteurs d'orientation (RocketSim : row 0 = forward, row 1 = right)
-    right = phys.rotation_mtx[1]
-
-    # But adverse (dans le repère inverted : toujours à Y négatif)
-    their_goal = np.array([0.0, -BACK_NET_Y, 0.0], dtype=np.float32)
-
-    to_ball      = ball_pos - car_pos
-    dist_to_ball = float(np.linalg.norm(to_ball))
-
-    # Direction cible : approche directe si loin, position derrière balle si proche
-    if dist_to_ball > 500 or dist_to_ball < 1e-6:
-        target_dir = to_ball / (dist_to_ball + 1e-6)
-    else:
-        # Se positionner entre le but et la balle pour shooter
-        ball_to_goal = their_goal - ball_pos
-        n = float(np.linalg.norm(ball_to_goal))
-        if n > 1e-6:
-            # Point 300 uu derrière la balle (côté de notre voiture)
-            ideal_pos = ball_pos - ball_to_goal / n * 300
-            d = ideal_pos - car_pos
-            dist_d = float(np.linalg.norm(d))
-            target_dir = d / (dist_d + 1e-6)
-        else:
-            target_dir = to_ball / (dist_to_ball + 1e-6)
-
-    # Steer : dot produit avec vecteur droit
-    dot_right = float(np.dot(right, target_dir))
-    if   dot_right >  0.15: steer_idx = 2   # virage droite
-    elif dot_right < -0.15: steer_idx = 0   # virage gauche
-    else:                   steer_idx = 1   # tout droit
-
-    # Pitch : neutre (garder simple, éviter le saut intempestif)
-    pitch_idx = 1
-
-    # Toujours plein gaz + boost agressif
-    return np.array([2, steer_idx, pitch_idx, steer_idx, 1, 0, 1, 0], dtype=np.int32)
-    # [throttle=+1, steer, pitch=0, yaw=steer, roll=0, jump=0, boost=1, handbrake=0]
-
-
-class HeuristicOpponentWrapper(gym.Env):
-    """
-    Transforme l'env 2-agents en env 1-agent pour rlgym-ppo.
-    Blue = entraîné par PPO.
-    Orange = contrôlé par l'heuristique (ne participe pas aux gradients).
+    Self-play avec pool de checkpoints passés.
+    Blue  = policy courante entraînée par PPO.
+    Orange = checkpoint gelé, pioché aléatoirement dans l'historique.
+             Swappé toutes les `swap_every` steps.
+             Avant qu'un checkpoint existe → actions aléatoires.
     """
 
-    def __init__(self, inner_env):
-        self._inner = inner_env          # MultiDiscreteGymWrapper (2 agents)
+    def __init__(self, inner_env: DiscreteGymWrapper,
+                 checkpoint_dir: str,
+                 swap_every: int = 3_000_000,
+                 pool_size: int = 10,
+                 device: str = "cuda"):
+        self._inner          = inner_env
+        self._ckpt_dir       = Path(checkpoint_dir)
+        self._swap_every     = swap_every
+        self._pool_size      = pool_size
+        self._device         = torch.device(device)
+        self._steps          = 0
+        self._opponent       = None          # DiscreteFF gelée, ou None
+        self._blue_idx       = 0
+        self._orange_idx     = 1
+
         n_obs = inner_env.observation_space.shape[0]
         self.observation_space = gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(n_obs,), dtype=np.float32
+            -np.inf, np.inf, shape=(n_obs,), dtype=np.float32
         )
         self.action_space = inner_env.action_space
-        self._blue_idx   = 0
-        self._orange_idx = 1
 
+    # ------------------------------------------------------------------
     def _find_indices(self):
-        """Identifie quel index correspond à blue/orange après reset."""
         state = self._inner.rlgym_env.state
         for idx, agent_id in self._inner.agent_map.items():
             if state.cars[agent_id].is_blue:
@@ -476,28 +446,59 @@ class HeuristicOpponentWrapper(gym.Env):
             else:
                 self._orange_idx = idx
 
+    def _load_random_opponent(self):
+        """Charge un checkpoint aléatoire parmi les `pool_size` derniers."""
+        step_dirs = sorted(
+            (p for p in self._ckpt_dir.iterdir()
+             if p.is_dir() and p.name.isdigit()),
+            key=lambda p: int(p.name),
+        )
+        if not step_dirs:
+            self._opponent = None
+            return
+
+        pool   = step_dirs[-self._pool_size:]
+        chosen = random.choice(pool) / "PPO_POLICY.pt"
+        if not chosen.exists():
+            self._opponent = None
+            return
+
+        from rlgym_ppo.ppo import DiscreteFF
+        state_dict = torch.load(chosen, map_location=self._device)
+        obs_size   = state_dict[next(iter(state_dict))].shape[1]
+        model      = DiscreteFF(obs_size, [512, 512], self._device)
+        model.load_state_dict(state_dict)
+        model.eval()
+        self._opponent = model
+        print(f"[SelfPlay] Nouvel adversaire chargé : {chosen.parent.name} steps")
+
+    # ------------------------------------------------------------------
     def reset(self):
         obs_all = self._inner.reset()
         self._find_indices()
         return obs_all[self._blue_idx]
 
     def step(self, blue_action):
-        # Calcul de l'action orange AVANT le step (sur l'état courant)
-        state     = self._inner.rlgym_env.state
-        orange_id = self._inner.agent_map[self._orange_idx]
-        opp_action = _heuristic_action(state, orange_id)
+        self._steps += 1
+        if self._steps % self._swap_every == 0:
+            self._load_random_opponent()
 
-        # rlgym-ppo peut envoyer blue_action en (1,8) ou (8,) — normaliser
-        blue_flat = np.asarray(blue_action).flatten()   # toujours (8,)
+        # Action orange
+        if self._opponent is None:
+            opp_action = random.randint(0, _N_ACTIONS - 1)
+        else:
+            orange_obs = self._inner.obs_buffer[self._orange_idx]
+            obs_t = torch.FloatTensor(orange_obs).unsqueeze(0).to(self._device)
+            with torch.no_grad():
+                act, _ = self._opponent.get_action(obs_t, deterministic=False)
+            opp_action = int(np.asarray(act).flat[0])
 
-        # Construction du tableau d'actions pour les 2 agents
-        n_agents = len(self._inner.agent_map)
-        actions  = np.zeros((n_agents, len(blue_flat)), dtype=np.float32)
-        actions[self._blue_idx]   = blue_flat
+        b_idx   = int(np.asarray(blue_action).flat[0])
+        actions = np.array([0, 0], dtype=np.int32)
+        actions[self._blue_idx]   = b_idx
         actions[self._orange_idx] = opp_action
 
         obs_all, rews, done, truncated, info = self._inner.step(actions)
-
         return obs_all[self._blue_idx], rews[self._blue_idx], done, truncated, info
 
     def close(self):
@@ -507,9 +508,8 @@ class HeuristicOpponentWrapper(gym.Env):
 # ---------------------------------------------------------------------------
 # Environment Builder
 # ---------------------------------------------------------------------------
-
 def build_rlgym_v2_env():
-    action_parser = RepeatAction(MultiDiscreteActionParser(), repeats=8)
+    action_parser = RepeatAction(DiscreteActionParser(), repeats=ACTION_REPEAT)
 
     termination_condition = GoalCondition()
     truncation_condition  = AnyCondition(
@@ -521,12 +521,12 @@ def build_rlgym_v2_env():
         zero_padding=1,
         pos_coef=np.asarray([
             1 / common_values.SIDE_WALL_X,
-            1 / common_values.BACK_NET_Y,
-            1 / common_values.CEILING_Z,
+            1 / BACK_NET_Y,
+            1 / CEILING_Z,
         ]),
         ang_coef     = 1 / np.pi,
-        lin_vel_coef = 1 / common_values.CAR_MAX_SPEED,
-        ang_vel_coef = 1 / common_values.CAR_MAX_ANG_VEL,
+        lin_vel_coef = 1 / CAR_MAX_SPEED,
+        ang_vel_coef = 1 / CAR_MAX_ANG_VEL,
         boost_coef   = 1 / 100.0,
     )
 
@@ -536,22 +536,27 @@ def build_rlgym_v2_env():
     )
 
     rlgym_env = RLGym(
-        state_mutator    = state_mutator,
-        obs_builder      = obs_builder,
-        action_parser    = action_parser,
-        reward_fn        = CurriculumCombinedReward(n_proc=N_PROC),
-        termination_cond = termination_condition,
-        truncation_cond  = truncation_condition,
-        transition_engine= RocketSimEngine(),
+        state_mutator     = state_mutator,
+        obs_builder       = obs_builder,
+        action_parser     = action_parser,
+        reward_fn         = AdvancedReward(),
+        termination_cond  = termination_condition,
+        truncation_cond   = truncation_condition,
+        transition_engine = RocketSimEngine(),
     )
 
-    return HeuristicOpponentWrapper(MultiDiscreteGymWrapper(rlgym_env))
+    return PopulationSelfPlayWrapper(
+        DiscreteGymWrapper(rlgym_env),
+        checkpoint_dir = "data/checkpoints/prl-run-v2",
+        swap_every     = 3_000_000,
+        pool_size      = 10,
+        device         = "cuda",
+    )
 
 
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
-
 def main():
     global _learner
 
@@ -563,19 +568,19 @@ def main():
         min_inference_size      = min_inference_size,
         metrics_logger          = None,
         device                  = "cuda",
-        checkpoints_save_folder = "data/checkpoints/prl-run",
+        checkpoints_save_folder = "data/checkpoints/prl-run-v2",
         add_unix_timestamp      = False,
         n_checkpoints_to_keep   = 10,
-        ppo_batch_size          = 60_000,
-        policy_layer_sizes      = [512, 512],
-        critic_layer_sizes      = [512, 512],
-        ts_per_iteration        = 120_000,  # 2× : plus de signal sparse par update
-        exp_buffer_size         = 360_000,  # ts_per_iteration × 3
-        ppo_minibatch_size      = 12_000,   # ratio constant
-        ppo_ent_coef            = 0.0005,
+        ppo_batch_size          = 50_000,
+        policy_layer_sizes      = [1024, 1024],
+        critic_layer_sizes      = [1024, 1024],
+        ts_per_iteration        = 100_000,   # Necto : 100k
+        exp_buffer_size         = 300_000,
+        ppo_minibatch_size      = 10_000,
+        ppo_ent_coef            = 0.01,      # Necto : 0.01
         policy_lr               = LR_INITIAL,
         critic_lr               = LR_INITIAL,
-        ppo_epochs              = 2,        # 3→2 : évite la dégradation de représentation
+        ppo_epochs              = 3,
         standardize_returns     = True,
         standardize_obs         = False,
         save_every_ts           = 500_000,

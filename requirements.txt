@@ -1,0 +1,12 @@
+# Rocket League environment
+rlgym[rl-sim]
+
+# PPO training framework
+rlgym-ppo @ git+https://github.com/AechPro/rlgym-ppo
+
+# PyTorch — install with CUDA 12.8 support:
+# pip install torch --index-url https://download.pytorch.org/whl/cu128
+torch
+
+numpy
+gym

@@ -1,6 +1,19 @@
 venv/
 __pycache__/
 *.pyc
-.ai/
-ai/data/
+*.pyo
+
+# Training data
+AI/data/
+data/
+
+# Claude Code
+.claude/
+
+# Build artifacts
+build/
+
+# Misc
+*.stackdump
+*.docx
 wandb/

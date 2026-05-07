@@ -1,111 +1,93 @@
-# PRL – Rocket League School Project
+# PRL — Rocket League RL Bot
 
-This repository contains a school project called **PRL**, focused on building and training Rocket League bots using **RLBot** and **RLGym / PPO**.
-
-- **Opponent bot** (hard-coded logic) lives in the `Opponent/` folder.
-- **Reinforcement learning (PPO) training setup** lives in the `AI/` folder.
-
-The goal is to:
-
-1. Have a reliable hard-coded opponent bot that can play full games.
-2. Train an AI bot with PPO on a simulated Rocket League environment.
-
----
+Reinforcement learning bot for Rocket League, trained with PPO using [rlgym-ppo](https://github.com/AechPro/rlgym-ppo) and [RocketSim](https://github.com/ZealanL/RocketSim).
 
 ## Project structure
 
-- `Opponent/`
+```text
+AI/
+  train_ppo.py   — PPO training script
+  bot.py         — RLBot v5 inference bot
+  bot.toml       — Bot configuration
+  rlbot.toml     — Match configuration
+Opponent/
+  src/bot.py     — Hard-coded rule-based opponent
+```
 
-  - `rlbot.toml` – RLBot match configuration for the opponent project.
-  - `run.py`, `run_only.py` – helper scripts to launch RLBot.
-  - `src/bot.py` – main hard-coded opponent bot (`MyBot`).
-  - `src/bot.toml`, `src/loadout.toml` – agent configuration and car loadout.
-  - `src/util/` – shared helper modules (physics, rendering, sequences, etc.).
-  - `requirements.txt` – Python dependencies for the RLBot opponent.
-- `AI/`
+## Architecture
 
-  - [ ] `train_ppo.py` – PPO training script using `rlgym` and `rlgym_ppo`.
-    - [ ] Defines `build_rlgym_v2_env()` (action parser, reward, obs builder, mutators, RocketSim engine).
-    - [ ] Creates a `Learner` and runs a basic PPO training loop.
-- `.gitignore` – excludes `venv`, training data and other generated files from git.
+### Observation — 101 floats
 
----
+| Block | Size | Content |
+| --- | --- | --- |
+| Ball | 9 | position, linear velocity, angular velocity |
+| Boost pads | 34 | recharge timer per pad |
+| Car (self) | 20 | position, orientation, velocities, boost, state |
+| Car (opponent) | 20 | same for opponent |
+| Relative vectors | 9 | ball→their goal, ball→own goal, car→ball |
+
+Values normalized by field dimensions and max speeds. Orange team observations are inverted on `[-1, -1, 1]`.
+
+### Action space — 90 discrete actions
+
+Pruned lookup table combining ground actions (throttle × steer × boost × handbrake) and aerial actions (pitch × yaw × roll × jump × boost). Each action repeats for 8 physics frames (~133ms).
+
+### Reward
+
+Delta-based rewards to prevent reward farming:
+
+- Delta player quality (Liu distance + alignment toward goal)
+- Delta state quality (ball toward opponent goal)
+- Touch height with wall distance factor
+- Touch acceleration
+- Flip reset
+- Boost management (sqrt-scaled gain, ground loss penalty)
+- Angular velocity encouragement
+- Demo events, goal reward
+
+Team spirit blending (0.6) with opponent punishment (1.0).
+
+### Network
+
+`101 → 1024 → 1024 → 90` with ReLU, trained with Adam.
+
+### Self-play
+
+Population self-play: the orange player uses a randomly sampled checkpoint from the last 10 saves, swapped every 3M steps.
 
 ## Prerequisites
 
-- Windows with **Rocket League** installed (Steam / Epic).
-- **Python 3.11+** (what the project currently uses).
-- Git.
-
----
+- Windows with Rocket League installed (Steam)
+- Python 3.11+
+- CUDA-capable GPU (recommended)
 
 ## Setup
 
-From the project root:
-
 ```bash
 python -m venv venv
-venv\Scripts\activate  # on PowerShell / cmd
-# or
-source venv/Scripts/activate  # in Git Bash with the right path
-
-# Install opponent bot requirements
-pip install -r Opponent/requirements.txt
-
-# Install RL training stack
-pip install "rlgym[rl-sim]"
-pip install git+https://github.com/AechPro/rlgym-ppo
-pip install torch  # or a CUDA build from pytorch.org if you have a GPU
+venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
----
-
-## Running the opponent bot
-
-There are two common ways:
-
-1. **Via RLBot GUI**
-
-   - Open `Opponent/src/bot.toml` in the RLBot GUI.
-   - Click **Run** to start a match with the opponent bot.
-2. **Via script** (depending on how `run.py` is set up):
+For GPU training (recommended), install PyTorch with CUDA 12.8 instead:
 
 ```bash
-venv\Scripts\activate
-python Opponent/run.py
+pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
 
-The hard-coded bot lives in `Opponent/src/bot.py` and uses the utilities in `Opponent/src/util/`.
-
----
-
-## Running PPO training (AI)
-
-From the project root:
+## Training
 
 ```bash
 venv\Scripts\activate
 python AI/train_ppo.py
 ```
 
-This will:
+Checkpoints are saved to `AI/data/checkpoints/` every 500k steps.
 
-- Build an `RLGym` v2 environment (`build_rlgym_v2_env`).
-- Wrap it with `RLGymV2GymWrapper`.
-- Start a **PPO** learner with a small batch size (good for quick tests).
-- Create a `data/` folder inside `AI/` containing checkpoints and logs.
+## Running the bot
 
-The first training run is mainly to verify:
+Add `AI/bot.toml` in the RLBot GUI. The bot automatically loads the latest checkpoint.
 
-- The **environment** is correctly configured.
-- The **GPU/CPU** is used (depending on your PyTorch install, whether or not you are using CUDA).
-- The training loop runs without crashing.
+## Running the opponent
 
----
-
-## Notes
-
-- The virtual environment `venv/` and large generated files are intentionally ignored by git.
-- The current AI part, is unavailable. It will be added later on in the project, for now we just have made sure that a PPO algorithm would run smoothly.
-- This codebase is meant as a teaching / experimentation project, not a polished production bot.
-- Feel free to tweak hyperparameters in `AI/train_ppo.py` once everything is confirmed working.
+Add `Opponent/src/bot.toml` in the RLBot GUI.

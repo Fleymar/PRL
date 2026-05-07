@@ -47,15 +47,15 @@ os.chdir(Path(__file__).resolve().parent)
 # Hyperparamètres
 # ---------------------------------------------------------------------------
 TOTAL_TIMESTEPS = 500_000_000   # fresh start
-N_PROC          = 40
+N_PROC          = 20
 ACTION_REPEAT   = 8
 
-# Cosine LR schedule (Necto utilise 1e-4 fixe, on garde notre cosine)
+# Cosine LR schedule
 LR_INITIAL = 5e-4
 LR_FINAL   = 5e-5
 LR_CYCLE   = 100_000_000
 
-# Goals Necto-style
+# Goals
 BLUE_GOAL   = np.array([0.0, -BACK_NET_Y, 0.0], dtype=np.float32)
 ORANGE_GOAL = np.array([0.0,  BACK_NET_Y, 0.0], dtype=np.float32)
 
@@ -120,7 +120,7 @@ class ExtendedObs(DefaultObs):
 
 
 # ---------------------------------------------------------------------------
-# DiscreteActionParser — 90 actions discrètes (port exact de Necto/training/parser.py)
+# DiscreteActionParser — 90 actions discrètes
 # ---------------------------------------------------------------------------
 class DiscreteActionParser(ActionParser):
     def __init__(self):
@@ -176,7 +176,7 @@ class DiscreteGymWrapper(RLGymV2GymWrapper):
 
 
 # ---------------------------------------------------------------------------
-# AdvancedReward — port rlgym-v2 du NectoRewardFunction (sans rocket_learn)
+# AdvancedReward
 # ---------------------------------------------------------------------------
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     na = np.linalg.norm(a)
@@ -207,8 +207,6 @@ def _dist_to_closest_wall(x: float, y: float) -> float:
 
 class AdvancedReward(RewardFunction[AgentID, GameState, float]):
     """
-    Port rlgym-v2 du NectoRewardFunction.
-    Supprimé : win_prob (nécessite rocket_learn), scoreboard.
     Conservé  : distance exponentielle, touch hauteur (racine cubique),
                 flip reset, boost gain/lose, ang_vel, demo, team spirit.
     """
@@ -375,7 +373,7 @@ class AdvancedReward(RewardFunction[AgentID, GameState, float]):
                 for a in agents:
                     rewards[a] += self._goal_w if state.cars[a].team_num == ORANGE_TEAM else -self._goal_w
 
-        # ---- Team spirit blending (Necto : 0.6) ----
+        # ---- Team spirit blending (0.6) ----
         blue_ids   = [a for a in agents if state.cars[a].team_num == BLUE_TEAM]
         orange_ids = [a for a in agents if state.cars[a].team_num == ORANGE_TEAM]
         if blue_ids and orange_ids:
@@ -464,9 +462,9 @@ class PopulationSelfPlayWrapper(gym.Env):
             return
 
         from rlgym_ppo.ppo import DiscreteFF
-        state_dict = torch.load(chosen, map_location=self._device)
+        state_dict = torch.load(chosen, map_location="cpu")
         obs_size   = state_dict[next(iter(state_dict))].shape[1]
-        model      = DiscreteFF(obs_size, [512, 512], self._device)
+        model      = DiscreteFF(obs_size, 90, [1024, 1024], "cpu")
         model.load_state_dict(state_dict)
         model.eval()
         self._opponent = model
@@ -488,7 +486,7 @@ class PopulationSelfPlayWrapper(gym.Env):
             opp_action = random.randint(0, _N_ACTIONS - 1)
         else:
             orange_obs = self._inner.obs_buffer[self._orange_idx]
-            obs_t = torch.FloatTensor(orange_obs).unsqueeze(0).to(self._device)
+            obs_t = torch.FloatTensor(orange_obs).unsqueeze(0)
             with torch.no_grad():
                 act, _ = self._opponent.get_action(obs_t, deterministic=False)
             opp_action = int(np.asarray(act).flat[0])
@@ -574,10 +572,10 @@ def main():
         ppo_batch_size          = 50_000,
         policy_layer_sizes      = [1024, 1024],
         critic_layer_sizes      = [1024, 1024],
-        ts_per_iteration        = 100_000,   # Necto : 100k
+        ts_per_iteration        = 100_000,
         exp_buffer_size         = 300_000,
         ppo_minibatch_size      = 10_000,
-        ppo_ent_coef            = 0.01,      # Necto : 0.01
+        ppo_ent_coef            = 0.01,
         policy_lr               = LR_INITIAL,
         critic_lr               = LR_INITIAL,
         ppo_epochs              = 3,
